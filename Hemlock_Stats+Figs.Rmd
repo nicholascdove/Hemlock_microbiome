@@ -1,0 +1,1753 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+# Set up
+```{r setup, include=FALSE}
+
+# CRAN Packages
+library(cowplot)
+library(dplyr)
+library(ggplot2)
+library(Hmisc)
+library(knitr)
+library(readxl)
+library(stringr)
+library(vegan)
+library(viridis)
+library(tidyr)
+library(doParallel)
+library(tibble)
+library(SpadeR)
+library(nlme)
+library(hillR)
+library(yaml)
+library(multcomp)
+
+# BiocManager Packages
+library(ape)
+library(biomformat)
+library(Biostrings)
+library(DESeq2)
+library(phyloseq)
+library(microbiome)
+
+#source("~/Desktop/MicrobiomeScripts/qza_to_phyloseq.R")
+#source("~/Desktop/MicrobiomeScripts/random_functions.R")
+
+theme_set(theme_cowplot())
+
+theme_update(axis.title = element_text(size = 12), axis.text = element_text(size = 10), 
+             legend.title = element_blank(), legend.text = element_text(size = 10), 
+             title = element_text(size = 12))
+```
+
+# Download data
+```{r}
+setwd("~/Desktop/NCHemlock2018/Frontiers_resubmission/")
+data_16S <- read_csv2phyloseq(otu.file = "Table_S4-SV-16S.csv", 
+                              taxonomy.file = "Table_S5-TAXONOMY-16S.csv", 
+                              metadata.file = "Table_S6-METADATA-16S.csv")
+
+sample_data(data_16S)$Habitat <- ordered(sample_data(data_16S)$Habitat, c("Needle", "Branch", "Root", "Rhizosphere"))
+sample_data(data_16S)$infestation <- ordered(sample_data(data_16S)$infestation, c("Low", "High"))
+
+setwd("~/Desktop/NCHemlock2018/Frontiers_resubmission/")
+data_ITS <- read_csv2phyloseq(otu.file = "Table_S7-SV-ITS.csv", 
+                              taxonomy.file = "Table_S8-TAXONOMY-ITS.csv", 
+                              metadata.file = "Table_S9-METADATA-ITS.csv")
+
+sample_data(data_ITS)$Habitat <- ordered(sample_data(data_ITS)$Habitat, c("Needle", "Branch", "Root", "Rhizosphere"))
+sample_data(data_ITS)$infestation <- ordered(sample_data(data_ITS)$infestation, c("Low", "High"))
+
+data_ITS <- subset_samples(data_ITS, Habitat != "fungal")
+data_ITS <- subset_taxa(data_ITS, Kingdom == "k__Fungi")
+
+data_16S <- prune_samples(sample_sums(data_16S)>=1000, data_16S)
+data_ITS <- prune_samples(sample_sums(data_ITS)>=1000, data_ITS)
+
+data_16S_counts <- data_16S
+data_16S <- transform_sample_counts(data_16S, function(x) x/sum(x))
+data_ITS_counts <- data_ITS
+data_ITS <- transform_sample_counts(data_ITS, function(x) x/sum(x))
+
+sum(colSums(otu_table(data_16S_counts)))
+sort(colSums(otu_table(data_16S_counts)))
+
+sum(colSums(otu_table(data_ITS_counts)))
+sort(colSums(otu_table(data_ITS_counts)))
+```
+# Alpha Diversity
+## Rarefaction Curves
+```{r}
+# Funciton --------------
+calculate_rarefaction_curves <- function(psdata, measures, depths, parallel=T) {
+  require('plyr') # ldply
+  require('reshape2') # melt
+  require('doParallel')
+
+  # set parallel options if required
+  if (parallel) {
+    paropts  <- list(.packages=c("phyloseq", "reshape2"))
+  } else {
+    paropts  <- NULL
+  }
+
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+
+    # as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+
+    molten_alpha_diversity
+  }
+
+  names(depths) <- depths # this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive() && ! parallel, 'text', 'none'), .parallel=parallel, .paropts=paropts)
+
+  # convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+
+  rarefaction_curve_data
+}
+
+# 16S ----------------------------------------------
+detectCores(all.tests=TRUE)
+
+cl <- makeCluster(detectCores(all.tests=TRUE),setup_strategy = "sequential")
+registerDoParallel(cl)
+
+rarefaction_curve_data <- calculate_rarefaction_curves(data_16S_counts, c('Observed', 'Shannon'), 
+                                                       rep(c(1, 10, 100, 1000, 1:100 * 10000), each = 10))
+
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, 
+                                        Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary, 
+                                                data.frame(sample_data(data_16S_counts)), 
+                                                by.x = 'Sample', by.y = 'row.names')
+
+
+p <- ggplot(rarefaction_curve_data_summary_verbose %>% filter(Measure == "Observed"), 
+       aes(x = Depth, y = Alpha_diversity_mean,  ymin = Alpha_diversity_mean - Alpha_diversity_sd, 
+           ymax = Alpha_diversity_mean + Alpha_diversity_sd, colour = species,shape = infestation, group = Sample)) + 
+  geom_line() + 
+  geom_pointrange() + 
+  scale_color_discrete("Host Species") +
+  scale_shape_discrete("HWA pop.") +
+  scale_x_continuous(trans = "log10", name = "Sequence Depth") +
+  ylab("Richness") +
+  facet_wrap(~Habitat, scales = 'free') +
+  theme(legend.title = element_text(size = 12))
+
+# ITS ----------------------
+
+detectCores(all.tests=TRUE)
+
+cl <- makeCluster(detectCores(all.tests=TRUE), setup_strategy = "sequential")
+registerDoParallel(cl)
+
+rarefaction_curve_data <- calculate_rarefaction_curves(data_ITS_counts, c('Observed', 'Shannon'), 
+                                                       rep(c(1, 10, 100, 1000, 1:100 * 10000), each = 10))
+
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, 
+                                        Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary %>% mutate(Sample = gsub("[.]", "-", Sample)), 
+                                                data.frame(sample_data(data_ITS_counts)) %>% 
+                                                  rownames_to_column(var = "rowname") %>%
+                                                  mutate(rowname = paste0("X", rowname)), 
+                                                by.x = 'Sample', by.y = 'rowname')
+
+
+p2 <- ggplot(rarefaction_curve_data_summary_verbose %>% filter(Measure == "Observed"), 
+       aes(x = Depth, y = Alpha_diversity_mean,  ymin = Alpha_diversity_mean - Alpha_diversity_sd, 
+           ymax = Alpha_diversity_mean + Alpha_diversity_sd, colour = species,shape = infestation, group = Sample)) + 
+  geom_line() + 
+  geom_pointrange() + 
+  scale_color_discrete("Host Species") +
+  scale_shape_discrete("HWA pop.") +
+  scale_x_continuous(trans = "log10", name = "Sequence Depth") +
+  ylab("Richness") +
+  facet_wrap(~Habitat, scales = 'free') +
+  theme(legend.title = element_text(size = 12))
+
+prow <- plot_grid(p + theme(legend.position = "none"), p2 + theme(legend.position = "none"), ncol = 1, labels = "AUTO", align = "vh")
+
+leg <- get_legend(p)
+
+prow <- plot_grid(prow, leg, ncol = 2, rel_widths = c(1, 0.23))
+
+tiff("~/Desktop/NCHemlock2018/rarefaction.tiff", res = 100, height = 8, width = 6.5, units = "in")
+prow
+dev.off()
+```
+
+
+## Alpha Diversity Stats and Figure 1
+```{r}
+# Set up and Stats ------------------------------------------------------
+set.seed(01221990)
+rare_16S <- rarefy_even_depth(data_16S_counts, sample.size = 1000)
+OTU_16S <- t(as(rare_16S@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+
+rich_16S <- hill_taxa(OTU_16S, q = 0)
+rich_16S <- merge(data_16S_counts@sam_data, rich_16S, by = 0)
+
+shan_16S <- hill_taxa(OTU_16S, q = 1)
+shan_16S <- merge(data_16S_counts@sam_data, shan_16S, by = 0)
+
+rich_16S <- rich_16S %>% mutate(spec = as.factor(species))
+
+model <- lme(y ~ infestation*spec*Habitat, random=~1|tree.ID, data = rich_16S, method="REML")
+anova.lme(model, type="sequential", adjustSigma = T)
+summary(glht(model, mcp(Habitat="Tukey"))) 
+
+model <- lme(y ~ infestation*species*Habitat, random=~1|tree.ID, data = shan_16S, method="REML")
+anova.lme(model, type="sequential", adjustSigma = FALSE)
+summary(glht(model, mcp(species ="Tukey"))) 
+
+set.seed(01221990)
+rare_ITS <- rarefy_even_depth(data_ITS_counts, sample.size = 1000)
+OTU_ITS <- t(as(rare_ITS@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+
+rich_ITS <- hill_taxa(OTU_ITS, q = 0)
+rich_ITS <- merge(data_ITS_counts@sam_data, rich_ITS, by = 0)
+
+shan_ITS <- hill_taxa(OTU_ITS, q = 1)
+shan_ITS <- merge(data_ITS_counts@sam_data, shan_ITS, by = 0)
+
+model <- lme(y ~ infestation*species*Habitat, random=~1|tree.ID, data = rich_ITS, method="REML")
+anova.lme(model, type="sequential", adjustSigma = FALSE)
+summary(glht(model, mcp(Habitat="Tukey"))) 
+
+model <- lme(y ~ infestation*species*Habitat, random=~1|tree.ID, data = shan_ITS, method="REML")
+anova.lme(model, type="sequential", adjustSigma = FALSE)
+summary(glht(model, mcp(Habitat="Tukey"))) 
+
+
+x <- aov(y~ infestation*species, rich_ITS %>% filter(Habitat == "Needle"))
+shapiro.test(residuals(x))
+summary(x) 
+TukeyHSD(x) 
+
+x <- aov(y ~ infestation*species, rich_ITS %>% filter(Habitat == "Branch"))
+shapiro.test(residuals(x)) 
+summary(x) 
+
+x <- aov(y ~ infestation*species, rich_ITS %>% filter(Habitat == "Root"))
+shapiro.test(residuals(x)) 
+summary(x) 
+TukeyHSD(x) 
+
+x <- aov(y ~ infestation*species, rich_ITS %>% filter(Habitat == "Rhizosphere"))
+shapiro.test(residuals(x)) 
+summary(x) 
+
+
+x <- aov(y~ infestation*species, shan_ITS %>% filter(Habitat == "Needle"))
+shapiro.test(residuals(x)) 
+summary(x) 
+TukeyHSD(x) 
+
+x <- aov(y ~ infestation*species, shan_ITS %>% filter(Habitat == "Branch"))
+shapiro.test(residuals(x)) 
+summary(x) 
+
+x <- aov(y ~ infestation*species, shan_ITS %>% filter(Habitat == "Root"))
+shapiro.test(residuals(x)) 
+summary(x) 
+
+x <- aov(y ~ infestation*species, shan_ITS %>% filter(Habitat == "Rhizosphere"))
+shapiro.test(residuals(x)) 
+summary(x) 
+
+
+# Plot ---------------------------------------------
+rich_16S$Amplicon <- "16S"
+rich_ITS$Amplicon <- "ITS"
+rich <- rbind(rich_16S %>% dplyr::select(Habitat, y,infestation, species, Amplicon),
+              rich_ITS %>% dplyr::select(Habitat, y,infestation, species, Amplicon))
+
+rich %>%
+  ggplot(aes(x = Habitat, y = y, fill = interaction(infestation, species))) +
+    geom_boxplot() +
+    facet_grid(rows = vars(Amplicon), 
+               labeller = labeller(Amplicon = c("16S" = "Archaea/\nBacteria", "ITS" = "Fungi")),
+               scales = "free") +
+    scale_x_discrete(name = NULL, labels = c("Needle", "Stem", "Root", "Rhizosphere")) +
+    scale_y_continuous(name = bquote(~phantom()^0*italic(D))) +
+    scale_fill_manual("HWA pop. - Species",
+                      values = c("cadetblue1", "cadetblue4", "darkgoldenrod1", "darkgoldenrod4"),
+                      labels = c(expression(paste("Low  - ", italic("T. canadensis"), sep = "")),
+                                 expression(paste("High - ", italic("T. canadensis"), sep = "")),
+                                 expression(paste("Low  - ", italic("T. sieboldii"), sep = "")),
+                                 expression(paste("High - ", italic("T. sieboldii"), sep = "")))) +
+    panel_border() +
+    theme(strip.text.y = element_text(size = 12), legend.text = element_text(hjust = 0),
+          legend.title = element_text(size = 12)) +
+    geom_vline(xintercept = c(1.5, 2.5, 3.5), linetype = "dotted") -> p_chao
+
+shan_16S$Amplicon <- "16S"
+shan_ITS$Amplicon <- "ITS"
+shan <- rbind(shan_16S %>% dplyr::select(Habitat, y,infestation, species, Amplicon),
+              shan_ITS %>% dplyr::select(Habitat, y,infestation, species, Amplicon))
+
+shan %>%
+  ggplot(aes(x = Habitat, y = y, fill = interaction(infestation, species))) +
+    geom_boxplot() +
+    facet_grid(rows = vars(Amplicon), 
+               labeller = labeller(Amplicon = c("16S" = "Archaea/\nBacteria", "ITS" = "Fungi")),
+               scales = "free") +
+    scale_x_discrete(name = NULL, labels = c("Needle", "Stem", "Root", "Rhizosphere")) +
+    scale_y_continuous(name = bquote(~phantom()^1*italic(D))) +
+    scale_fill_manual("HWA pop. - Species",
+                      values = c("cadetblue1", "cadetblue4", "darkgoldenrod1", "darkgoldenrod4"),
+                      labels = c(expression(paste("Low  - ", italic("T. canadensis"), sep = "")),
+                                 expression(paste("High - ", italic("T. canadensis"), sep = "")),
+                                 expression(paste("Low  - ", italic("T. sieboldii"), sep = "")),
+                                 expression(paste("High - ", italic("T. sieboldii"), sep = "")))) +
+    panel_border() +
+    theme(strip.text.y = element_text(size = 12), legend.text = element_text(hjust = 0),
+          legend.title = element_text(size = 12)) +
+    geom_vline(xintercept = c(1.5, 2.5, 3.5), linetype = "dotted") -> p_shan
+
+leg <- get_legend(p_chao)
+prow <- plot_grid(p_chao + theme(legend.position = "none"), p_shan + theme(legend.position = "none"), ncol = 1, labels = "AUTO", align = "vh")
+fig.1 <- plot_grid(prow, leg, ncol = 2, rel_widths = c(1, 0.32))
+
+
+tiff("~/Desktop/NCHemlock2018/Frontiers_resubmission/Figure_1.tiff", res = 100, height = 6, width = 6.5, units = "in")
+fig.1
+dev.off()
+```
+
+# Beta Diversity
+## 16S
+```{r}
+# Full Model -----------------------------------------------------
+df_16S <- data.frame(sample_data(data_16S))
+OTU_16S <- t(as(data_16S@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+dist_16S <- vegdist(OTU_16S, "jaccard")
+
+perm <- how(complete = TRUE, 
+            within   = Within(type = "none"),
+            plots    = with(df_16S, Plots(strata = tree.ID, type = "free")))
+
+set.seed(01221990)
+mod<-dbrda(dist_16S ~ species*Habitat*infestation, data = df_16S, permutations = perm)
+set.seed(01221990)
+anova(mod, by = "margin", permutations = 9999)
+summary(mod)
+
+y <- varpart(dist_16S, ~species, ~infestation, ~Habitat, data = df_16S)
+showvarparts(3)
+
+# Break subset by plant niche------------------------------------------------
+# First test interaction
+for(i in levels(as.factor(data_16S@sam_data$Habitat))){
+  sub <- subset_samples(data_16S, Habitat %in% i) #subset by compartment
+  samp <- data.frame(sub@sam_data) # create sample data matrix
+  
+  OTU_16S <- t(as(sub@otu_table, "matrix"))
+  OTU_16S <- as.data.frame(OTU_16S)
+  dist_16S <- vegdist(OTU_16S, "jaccard")
+
+  set.seed(12290)
+  mod <- dbrda(dist_16S ~ infestation*species, data = samp, permutations = 9999)
+  print(i)
+  set.seed(12290)
+  print(anova(mod, by = "margin", permutations = 9999))
+  y <- varpart(dist_16S, ~infestation, ~species, data = samp)
+  print(y$part$fract$Adj.R.squared[1:2])
+}
+
+# No test main effects
+for(i in levels(as.factor(data_16S@sam_data$Habitat))){
+  sub <- subset_samples(data_16S, Habitat %in% i) #subset by compartment
+  samp <- data.frame(sub@sam_data) # create sample data matrix
+  
+  OTU_16S <- t(as(sub@otu_table, "matrix"))
+  OTU_16S <- as.data.frame(OTU_16S)
+  dist_16S <- vegdist(OTU_16S, "jaccard")
+
+  set.seed(12290)
+  mod <- dbrda(dist_16S ~ infestation + species, data = samp, permutations = 9999)
+  print(i)
+  set.seed(12290)
+  print(anova(mod, by = "margin", permutations = 9999))
+  y <- varpart(dist_16S, ~infestation, ~species, data = samp)
+  print(y$part$fract$Adj.R.squared[1:2])
+}
+
+# Now look at species*infestation interaction in root
+sub <- subset_samples(data_16S, Habitat == "Root" & species == "T. sieboldii") #subset by compartment
+samp <- data.frame(sub@sam_data) # create sample data matrix
+OTU_16S <- t(as(sub@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+dist_16S <- vegdist(OTU_16S, "jaccard")
+
+set.seed(12290)
+mod <- dbrda(dist_16S ~ infestation, data = samp, permutations = 9999)
+set.seed(12290)
+print(anova(mod, by = "margin", permutations = 9999))
+RsquareAdj (mod)
+
+sub <- subset_samples(data_16S, Habitat == "Root" & species == "T. canadensis") #subset by compartment
+samp <- data.frame(sub@sam_data) # create sample data matrix
+OTU_16S <- t(as(sub@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+dist_16S <- vegdist(OTU_16S, "jaccard")
+
+set.seed(12290)
+mod <- dbrda(dist_16S ~ infestation, data = samp, permutations = 9999)
+set.seed(12290)
+print(anova(mod, by = "margin", permutations = 9999))
+RsquareAdj (mod)
+
+# Plots------------------------------------------
+myplots <- list()
+for(i in levels(as.factor(data_16S@sam_data$Habitat))){
+  sub <- subset_samples(data_16S, Habitat %in% i) #subset by compartment
+  samp <- data.frame(sub@sam_data) # create sample data matrix
+  
+  OTU_16S <- t(as(sub@otu_table, "matrix"))
+  OTU_16S <- as.data.frame(OTU_16S)
+  dist_16S <- vegdist(OTU_16S, "jaccard")
+
+  set.seed(12290)
+  mod <- dbrda(dist_16S ~ infestation+species, data = samp, permutations = 9999)
+  merge(summary(mod)$sites, samp, by = "row.names") %>%
+    ggplot(aes(x = dbRDA1, y = dbRDA2, shape = species, fill = infestation)) +
+    geom_point(size = 4, alpha = 0.5) +
+    scale_shape_manual(values = c(21,24), name = "Host Species",
+                       labels = c(expression(italic("T. canadensis")), 
+                                  expression(italic("T. sieboldii")))) +
+    ggtitle(i) +
+    scale_x_continuous(name = paste0(paste0("dbRDA 1 (", round(100*as.data.frame(summary(mod)$cont)[2,1], 1)), "%)")) +
+    scale_y_continuous(name = paste0(paste0("dbRDA 2 (", round(100*as.data.frame(summary(mod)$cont)[2,2], 1)), "%)")) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.text = element_text(hjust = 0), title = element_text(size = 12),
+          legend.title = element_text(size = 12)) +
+    guides(fill = guide_legend(override.aes = list(pch = 21), title = "HWA pop.")) -> p2
+  myplots[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid <- plot_grid(plotlist = myplots, align = "vh")
+fig.2 <- plot_grid(grid, leg, ncol = 2, rel_widths = c(1, 0.35))
+
+tiff("~/Desktop/NCHemlock2018/Frontiers_resubmission/Figure_2.tiff", res = 100, height = 4.5, width = 6.5, units = "in")
+fig.2
+dev.off()
+```
+
+## ITS
+```{r}
+# Full Model --------------------------------------------
+df_ITS <- data.frame(sample_data(data_ITS))
+OTU_ITS <- t(as(data_ITS@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+dist_ITS <- vegdist(OTU_ITS, "jaccard")
+
+perm <- how(complete = TRUE, 
+            within   = Within(type = "none"),
+            plots    = with(df_ITS, Plots(strata = tree.ID, type = "free")))
+
+mod<-dbrda(dist_ITS ~ species:Habitat:infestation, data = df_ITS, permutations = perm)
+set.seed(01221990)
+anova(mod, by = "margin", permutations = 9999)
+summary(mod)
+
+y <- varpart(dist_ITS, ~species, ~infestation, ~Habitat, data = df_ITS)
+showvarparts(3)
+
+# Break apart by plant-associated habitat ---------------------------------
+# First, look at interactions
+for(i in levels(as.factor(data_ITS@sam_data$Habitat))){
+  sub <- subset_samples(data_ITS, Habitat %in% i) #subset by compartment
+  samp <- data.frame(sub@sam_data) # create sample data matrix
+  
+  OTU_ITS <- t(as(sub@otu_table, "matrix"))
+  OTU_ITS <- as.data.frame(OTU_ITS)
+  dist_ITS <- vegdist(OTU_ITS, "jaccard")
+
+  set.seed(12290)
+  mod <- dbrda(dist_ITS ~ infestation*species, data = samp, permutations = 9999)
+  print(i)
+  set.seed(12290)
+  print(anova(mod, by = "margin", permutations = 9999))
+  y <- varpart(dist_ITS, ~infestation, ~species, data = samp)
+  print(y$part$fract$Adj.R.squared[1:2])
+}
+
+# Now look at main effects
+for(i in levels(as.factor(data_ITS@sam_data$Habitat))){
+  sub <- subset_samples(data_ITS, Habitat %in% i) #subset by compartment
+  samp <- data.frame(sub@sam_data) # create sample data matrix
+  
+  OTU_ITS <- t(as(sub@otu_table, "matrix"))
+  OTU_ITS <- as.data.frame(OTU_ITS)
+  dist_ITS <- vegdist(OTU_ITS, "jaccard")
+
+  set.seed(12290)
+  mod <- dbrda(dist_ITS ~ infestation*species, data = samp, permutations = 9999)
+  print(i)
+  set.seed(12290)
+  print(anova(mod, by = "margin", permutations = 9999))
+  y <- varpart(dist_ITS, ~infestation, ~species, data = samp)
+  print(y$part$fract$Adj.R.squared[1:2])
+}
+
+# Plots -------------------------------------------------------------
+myplots <- list()
+for(i in levels(as.factor(data_ITS@sam_data$Habitat))){
+  sub <- subset_samples(data_ITS, Habitat %in% i) #subset by compartment
+  samp <- data.frame(sub@sam_data) # create sample data matrix
+  
+  OTU_ITS <- t(as(sub@otu_table, "matrix"))
+  OTU_ITS <- as.data.frame(OTU_ITS)
+  dist_ITS <- vegdist(OTU_ITS, "jaccard")
+
+  set.seed(12290)
+  mod <- dbrda(dist_ITS ~ infestation+species, data = samp, permutations = 9999)
+  merge(summary(mod)$sites, samp, by = "row.names") %>%
+    ggplot(aes(x = dbRDA1, y = dbRDA2, shape = species, fill = infestation)) +
+    geom_point(size = 4, alpha = 0.5) +
+    scale_shape_manual(values = c(21,24), name = "Host Species",
+                       labels = c(expression(italic("T. canadensis")), 
+                                  expression(italic("T. sieboldii")))) +
+    ggtitle(i) +
+    scale_x_continuous(name = paste0(paste0("dbRDA 1 (", round(100*as.data.frame(summary(mod)$cont)[2,1], 1)), "%)")) +
+    scale_y_continuous(name = paste0(paste0("dbRDA 2 (", round(100*as.data.frame(summary(mod)$cont)[2,2], 1)), "%)")) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.text = element_text(hjust = 0), title = element_text(size = 12),
+          legend.title = element_text(size = 12)) +
+    guides(fill = guide_legend(override.aes = list(pch = 21), title = "HWA pop.")) -> p2
+  myplots[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid <- plot_grid(plotlist = myplots, align = "vh")
+fig.3 <- plot_grid(grid, leg, ncol = 2, rel_widths = c(1, 0.35))
+
+tiff("~/Desktop/NCHemlock2018/Frontiers_resubmission/Figure_3.tiff", res = 100, height = 4.5, width = 6.5, units = "in")
+fig.3
+dev.off()
+```
+
+# Taxonomy
+## 16S
+```{r}
+# Major Taxa ----------------------------------------------------------------------------------
+#Seperate Proteos, assign grouping by Class, glom, and melt
+proteos <- subset_taxa(data_16S, Class == "D_2__Alphaproteobacteria" |
+                                 Class == "D_2__Deltaproteobacteria" |
+                                 Class == "D_2__Gammaproteobacteria")
+colnames(tax_table(proteos))[1] <- "group"
+tax_table(proteos)[,"group"] <- tax_table(proteos)[,"Class"]
+proteos_glom <- tax_glom(proteos, taxrank = "group")
+proteos_melt <- psmelt(proteos_glom)
+
+#Do same for Archaea
+
+archaea <- subset_taxa(data_16S, Kingdom == "D_0__Archaea")
+colnames(tax_table(archaea))[1] <- "group"
+archaea_glom <- tax_glom(archaea, taxrank = "group")
+archaea_melt <- psmelt(archaea_glom)
+
+#Get the rest of the abundant phyla, assign grouping by phylum, glom, and melt
+abundant_non_proteos <- subset_taxa(data_16S, Phylum == "D_1__Verrucomicrobia" |
+                                              Phylum == "D_1__Chloroflexi"|
+                                              Phylum == "D_1__Planctomycetes"|
+                                              Phylum == "D_1__Patescibacteria" |
+                                              Phylum == "D_1__Armatimonadetes" |
+                                              Phylum == "D_1__Bacteroidetes" |
+                                              Phylum == "D_1__Acidobacteria" |
+                                              Phylum == "D_1__Actinobacteria")
+colnames(tax_table(abundant_non_proteos))[1] <- "group"
+tax_table(abundant_non_proteos)[,"group"] <- tax_table(abundant_non_proteos)[,"Phylum"]
+abundant_non_proteos_glom <- tax_glom(abundant_non_proteos, taxrank = "group")
+abundant_non_proteos_melt <- psmelt(abundant_non_proteos_glom)
+
+#concatenate the datasets
+data_16S_grouping <- rbind(proteos_melt, abundant_non_proteos_melt, archaea_melt)
+
+# Now split by species
+
+sum2 <- data_16S_grouping %>% 
+  group_by(infestation, Habitat, group, species) %>%
+  summarise(means = mean(Abundance))
+
+sum2$group <- sapply(strsplit(as.character(sum2$group), "__"), `[`, 2)
+
+rare <- sum2 %>%
+  group_by(infestation, Habitat, species) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(group = "Rare Taxa")
+
+sum2 = rbind(sum2, rare)
+
+sum2$group <- ordered(sum2$group, c("Archaea", "Alphaproteobacteria", "Deltaproteobacteria", 
+                                    "Gammaproteobacteria", "Acidobacteria",
+                                    "Actinobacteria", "Armatimonadetes", "Bacteroidetes", "Chloroflexi",
+                                    "Patescibacteria", "Planctomycetes", "Verrucomicrobia",
+                                    "Rare Taxa"))
+
+rel_plots_16S2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = group)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 10, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_16S2[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_16S2 <- plot_grid(plotlist = rel_plots_16S2, align = "vh")
+fig.S2 <- plot_grid(grid_rel_plots_16S2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+tiff("~/Desktop/NCHemlock2018/Figure_S2.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S2
+dev.off()
+
+# At the Order Level ----------------------------------------------
+
+order_sum_16S <- tapply(taxa_sums(data_16S), 
+                         tax_table(data_16S)[, "Order"], sum, na.rm=TRUE)
+top10order_16S <- names(sort(order_sum_16S, TRUE))[1:10]
+
+abundant_16S_order <- subset_taxa(data_16S, Order %in% top10order_16S)
+abundant_16S_order_glom <- tax_glom(abundant_16S_order, taxrank = "Order")
+abundant_16S_order_melt <- psmelt(abundant_16S_order_glom)
+
+sum2 <- abundant_16S_order_melt %>% 
+  group_by(Habitat, Order, species, infestation) %>%
+  summarise(means = mean(Abundance))
+
+#Fix names
+sum2$Order <- sapply(strsplit(as.character(sum2$Order), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(Habitat, species, infestation) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(Order = "Other/Unidentified Order")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+#order groups
+sum2$Order <- forcats::fct_relevel(sum2$Order, "Other/Unidentified Order", after = Inf)
+
+rel_plots_16S2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = Order)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 10, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_16S2[[i]] <- p2 + theme(legend.position = "none")
+}
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_16S2 <- plot_grid(plotlist = rel_plots_16S2, align = "vh")
+fig.S3 <- plot_grid(grid_rel_plots_16S2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+tiff("~/Desktop/NCHemlock2018/Figure_S3.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S3
+dev.off()
+
+# At the Family Level ----------------------------------------------
+family_sum_16S <- tapply(taxa_sums(data_16S), 
+                         tax_table(data_16S)[, "Family"], sum, na.rm=TRUE)
+top10family_16S <- names(sort(class_sum_16S, TRUE))[1:10]
+
+abundant_16S_family <- subset_taxa(data_16S, Family %in% top10family_16S)
+abundant_16S_family_glom <- tax_glom(abundant_16S_family, taxrank = "Family")
+abundant_16S_family_melt <- psmelt(abundant_16S_family_glom)
+
+sum2 <- abundant_16S_family_melt %>% 
+  group_by(Habitat, Family, species, infestation) %>%
+  summarise(means = mean(Abundance))
+
+#Fix names
+sum2$Family <- sapply(strsplit(as.character(sum2$Family), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(Habitat, species, infestation) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(Family = "Other/Unidentified Family")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+#order groups
+sum2$Family <- forcats::fct_relevel(sum2$Family, "Other/Unidentified Family", after = Inf)
+
+rel_plots_16S2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = Family)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 10, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_16S2[[i]] <- p2 + theme(legend.position = "none")
+}
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_16S2 <- plot_grid(plotlist = rel_plots_16S2, align = "vh")
+fig.S4 <- plot_grid(grid_rel_plots_16S2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+tiff("~/Desktop/NCHemlock2018/Figure_S4.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S4
+dev.off()
+
+# At the Genus Level ----------------------------------------------
+genus_sum_16S <- tapply(taxa_sums(data_16S), 
+                         tax_table(data_16S)[, "Genus"], sum, na.rm=TRUE)
+top10genus_16S <- names(sort(genus_sum_16S, TRUE))[1:10]
+
+abundant_16S_genus <- subset_taxa(data_16S, Genus %in% top10genus_16S)
+abundant_16S_genus_glom <- tax_glom(abundant_16S_genus, taxrank = "Genus")
+abundant_16S_genus_melt <- psmelt(abundant_16S_genus_glom)
+
+sum2 <- abundant_16S_genus_melt %>% 
+  filter(Genus != "D_5__uncultured" & Genus != "D_5__uncultured bacterium") %>%
+  group_by(Habitat, Genus, species, infestation) %>%
+  summarise(means = mean(Abundance))
+
+#Fix names
+sum2$Genus <- sapply(strsplit(as.character(sum2$Genus), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(Habitat, species, infestation) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(Genus = "Other/Unidentified Genus")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+#order groups
+sum2$Genus <- forcats::fct_relevel(sum2$Genus, "Other/Unidentified Genus", after = Inf)
+sum2$Genus <- dplyr::recode(sum2$Genus, "1174-901-12" = "Beijerinckiaceae: 1174-901-12")
+
+rel_plots_16S2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = Genus)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                                 "#8c564b", "#e377c2", "#bcbd22", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 10, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_16S2[[i]] <- p2 + theme(legend.position = "none")
+}
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_16S2 <- plot_grid(plotlist = rel_plots_16S2, align = "vh")
+fig.S5 <- plot_grid(grid_rel_plots_16S2, leg, ncol = 2, rel_widths = c(1, 0.55))
+
+tiff("~/Desktop/NCHemlock2018/Figure_S5.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S5
+dev.off()
+```
+
+## ITS
+```{r}
+# Phylum level ---------------------------------------------------------
+abundant_ITS <- subset_taxa(data_ITS, Phylum == "p__Ascomycota" |
+                                      Phylum == "p__Basidiomycota"|
+                                      Phylum == "p__Chytridiomycota"|
+                                      Phylum == "p__Mortierellomycota"|
+                                      Phylum == "p__Mucoromycota" |
+                                      Phylum == "p__Glomeromycota" |
+                                      Phylum == "p__unidentified")
+colnames(tax_table(abundant_ITS))[1] <- "group"
+tax_table(abundant_ITS)[,"group"] <- tax_table(abundant_ITS)[,"Phylum"]
+abundant_ITS_glom <- tax_glom(abundant_ITS, taxrank = "group")
+abundant_ITS_melt <- psmelt(abundant_ITS_glom)
+
+sum2 <- abundant_ITS_melt %>% 
+  group_by(infestation, Habitat, group, species) %>%
+  summarise(means = mean(Abundance))
+
+#Fix names
+sum2$group <- sapply(strsplit(as.character(sum2$group), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(infestation, Habitat, species) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(group = "Rare Taxa")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+sum2$group<- dplyr::recode(sum2$group, unidentified = "Unidentified")
+
+#order groups
+sum2$group <- ordered(sum2$group, c("Ascomycota", "Basidiomycota", "Chytridiomycota",
+                                    "Mortierellomycota", "Mucoromycota", "Glomeromycota", 
+                                    "Unidentified", "Rare Taxa"))
+
+rel_plots_ITS2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = group)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e","#1f77b4", "yellow", "#17becf",
+                               "#2ca02c", "#d62728", "grey", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 12, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_ITS2[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_ITS2 <- plot_grid(plotlist = rel_plots_ITS2, align = "vh")
+rel_ITS_2 <- plot_grid(grid_rel_plots_ITS2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+tiff("~/Desktop/NCHemlock2018/rel_ITS.tiff", res = 600, height = 7, width = 12, units = "in")
+rel_ITS_2
+dev.off()
+
+# At the Class level --------------------------------------
+abundant_ITS <- subset_taxa(data_ITS, Class == "c__Dothideomycetes" |
+                                      Class == "c__Agaricomycetes"|
+                                      Class == "c__Leotiomycetes"|
+                                      Class == "c__Eurotiomycetes"|
+                                      Class == "c__Sordariomycetes" |
+                                      Class == "c__Pezizomycetes" |
+                                      Class == "c__Tremellomycetes" |
+                                      Class == "c__Lecanoromycetes" |
+                                      Class == "c__Microbotryomycetes" |
+                                      Class == "c__unidentified")
+colnames(tax_table(abundant_ITS))[1] <- "group"
+tax_table(abundant_ITS)[,"group"] <- tax_table(abundant_ITS)[,"Class"]
+abundant_ITS_glom <- tax_glom(abundant_ITS, taxrank = "group")
+abundant_ITS_melt <- psmelt(abundant_ITS_glom)
+
+sum2 <- abundant_ITS_melt %>% 
+  group_by(infestation, Habitat, group, species) %>%
+  summarise(means = mean(Abundance))
+
+#Fix names
+sum2$group <- sapply(strsplit(as.character(sum2$group), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(infestation, Habitat, species) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(group = "Rare Taxa")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+sum2$group<- dplyr::recode(sum2$group, unidentified = "Unidentified")
+
+sum2$group <- ordered(sum2$group, c("Agaricomycetes", "Dothideomycetes", "Eurotiomycetes",
+                                    "Lecanoromycetes", "Leotiomycetes", "Microbotryomycetes", 
+                                    "Pezizomycetes", "Sordariomycetes", "Tremellomycetes",
+                                    "Unidentified", "Rare Taxa"))
+
+rel_plots_ITS2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = group)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e","#1f77b4", "yellow",  "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2",  "#17becf", 
+                                 "#7f7f7f","white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 10, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_ITS2[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_ITS2 <- plot_grid(plotlist = rel_plots_ITS2, align = "vh")
+fig.S7 <- plot_grid(grid_rel_plots_ITS2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+tiff("~/Desktop/NCHemlock2018/Figure_S7.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S7
+dev.off()
+
+# At the Order Level ----------------------------------------------
+order_sum_ITS <- tapply(taxa_sums(data_ITS), 
+                         tax_table(data_ITS)[, "Order"], sum, na.rm=TRUE)
+top10order_ITS <- names(sort(order_sum_ITS, TRUE))[1:11]
+
+abundant_ITS_order <- subset_taxa(data_ITS, Order %in% top10order_ITS)
+abundant_ITS_order_glom <- tax_glom(abundant_ITS_order, taxrank = "Order")
+abundant_ITS_order_melt <- psmelt(abundant_ITS_order_glom)
+
+sum2 <- abundant_ITS_order_melt %>% 
+  filter(Order != "o__unidentified") %>%
+  group_by(Habitat, Order, species, infestation) %>%
+  summarise(means = mean(Abundance))
+
+#Fix names
+sum2$Order <- sapply(strsplit(as.character(sum2$Order), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(Habitat, species, infestation) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(Order = "Other/Unidentified Order")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+#order groups
+sum2$Order <- forcats::fct_relevel(sum2$Order, "Other/Unidentified Order", after = Inf)
+
+rel_plots_ITS2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = Order)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 10, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_ITS2[[i]] <- p2 + theme(legend.position = "none")
+}
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_ITS2 <- plot_grid(plotlist = rel_plots_ITS2, align = "vh")
+fig.S8 <- plot_grid(grid_rel_plots_ITS2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+tiff("~/Desktop/NCHemlock2018/Figure_S8.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S8
+dev.off()
+
+# At the Family Level ----------------------------------------------
+family_sum_ITS <- tapply(taxa_sums(data_ITS), 
+                         tax_table(data_ITS)[, "Family"], sum, na.rm=TRUE)
+top10family_ITS <- names(sort(family_sum_ITS, TRUE))[1:11]
+
+top10family_ITS <- c(top10family_ITS, "f__Teichosporaceae")
+
+abundant_ITS_family <- subset_taxa(data_ITS, Family %in% top10family_ITS)
+abundant_ITS_family_glom <- tax_glom(abundant_ITS_family, taxrank = "Family")
+abundant_ITS_family_melt <- psmelt(abundant_ITS_family_glom)
+
+sum2 <- abundant_ITS_family_melt %>% 
+  filter(Family != "f__unidentified" & Family != "f__Chaetothyriales_fam_Incertae_sedis") %>%
+  group_by(Habitat, Family, species, infestation) %>%
+  summarise(means = mean(Abundance))
+
+#Fix names
+sum2$Family <- sapply(strsplit(as.character(sum2$Family), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(Habitat, species, infestation) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(Family = "Other/Unidentified Family")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+#order groups
+sum2$Family <- forcats::fct_relevel(sum2$Family, "Other/Unidentified Family", after = Inf)
+
+rel_plots_ITS2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = Family)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 10, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_ITS2[[i]] <- p2 + theme(legend.position = "none")
+}
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_ITS2 <- plot_grid(plotlist = rel_plots_ITS2, align = "vh")
+fig.S9 <- plot_grid(grid_rel_plots_ITS2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+tiff("~/Desktop/NCHemlock2018/Figure_S9.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S9
+dev.off()
+
+
+# At the Genus Level ----------------------------------------------
+genus_sum_ITS <- tapply(taxa_sums(data_ITS), 
+                         tax_table(data_ITS)[, "Genus"], sum, na.rm=TRUE)
+top10genus_ITS <- names(sort(genus_sum_ITS, TRUE))[1:11]
+
+abundant_ITS_genus <- subset_taxa(data_ITS, Genus %in% top10genus_ITS)
+abundant_ITS_genus_glom <- tax_glom(abundant_ITS_genus, taxrank = "Genus")
+abundant_ITS_genus_melt <- psmelt(abundant_ITS_genus_glom)
+
+sum2 <- abundant_ITS_genus_melt %>% 
+  filter(Genus != "g__unidentified") %>%
+  group_by(Habitat, Genus, species, infestation) %>%
+  summarise(means = mean(Abundance))
+
+#Fix names
+sum2$Genus <- sapply(strsplit(as.character(sum2$Genus), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(Habitat, species, infestation) %>%
+  summarise(means = 1- sum(means)) %>%
+  mutate(Genus = "Other/Unidentified Genus")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+#order groups
+sum2$Genus <- forcats::fct_relevel(sum2$Genus, "Other/Unidentified Genus", after = Inf)
+
+rel_plots_ITS2 <- list()
+for(i in levels(as.factor(sum2$Habitat))){
+  sub <- subset(sum2, Habitat %in% i)
+  p2 <- ggplot(sub, aes(x = infestation, y = means, fill = Genus)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 10, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12))
+  rel_plots_ITS2[[i]] <- p2 + theme(legend.position = "none")
+}
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_ITS2 <- plot_grid(plotlist = rel_plots_ITS2, align = "vh")
+fig.S10 <- plot_grid(grid_rel_plots_ITS2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+tiff("~/Desktop/NCHemlock2018/Figure_S10.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S10
+dev.off()
+```
+
+# Differential Abundance Analysis
+## 16S (Figure S6 & Table S2)
+```{r}
+# make a list of data frames for the for loop  
+data_16S_counts@sam_data$infestation <- as.character(data_16S_counts@sam_data$infestation) 
+data_16S_counts@sam_data$species <- as.character(data_16S_counts@sam_data$species) 
+data_16S_NE <- subset_samples(data_16S_counts, Habitat == "Needle")
+data_16S_ST <- subset_samples(data_16S_counts, Habitat == "Branch")
+data_16S_RE <- subset_samples(data_16S_counts, Habitat == "Root")
+data_16S_RH <- subset_samples(data_16S_counts, Habitat == "Rhizosphere")
+datas <- c(data_16S_NE, data_16S_ST, data_16S_RE, data_16S_RH)
+
+dif.abundance <- data.frame(matrix(ncol = 10, nrow = 0)) #Create empty df
+
+for(i in datas){
+  i <- prune_taxa(taxa_sums(i) > 0.5, i)
+  i@otu_table <- i@otu_table + 1
+  data.deseq <- phyloseq_to_deseq2(i, ~ infestation*species)
+  data.deseq$infestation = relevel(data.deseq$infestation, "Low")
+  diagdds <- DESeq(data.deseq, test = "Wald", fitType = "parametric", quiet = T)
+  res <- results(diagdds, contrast = c("infestation", "Low", "High"))
+  alpha <- 0.05
+  sigtab <- res[which(res$padj < alpha), ] #subset results tab to those below alpha
+  sigtab <- as.data.frame(sigtab)
+  sigtab <- cbind(as(sigtab, "data.frame"), as(tax_table(i)[rownames(sigtab), ], "matrix"))
+  sigtab$Habitat <- levels(as.factor(i@sam_data$Habitat))
+  sigtab$OTU <- row.names(sigtab)
+  dif.abundance <- rbind(dif.abundance, sigtab)
+}
+dif.abundance$OTU <- row.names(dif.abundance)
+
+write.csv(dif.abundance, "~/Desktop/NCHemlock2018/Frontiers_resubmission/Table_S2.csv")
+
+scaling <- data.frame(matrix(ncol = 10, nrow = 0))
+for(i in levels(as.factor(dif.abundance$Habitat))){
+  sub <- filter(dif.abundance, Habitat %in% i)
+  sub$base_scaling.plot <- sub$baseMean/max(sub$baseMean)*5
+  scaling <- rbind(scaling, sub)
+}
+dif.abundance <- merge(dif.abundance, scaling %>% dplyr::select(base_scaling.plot, OTU), by = "OTU")
+
+dif.abundance$Group <- sapply(strsplit(as.character(dif.abundance$Phylum ), "__"), `[`, 2) 
+dif.abundance$Group[dif.abundance$Kingdom == "D_0__Archaea"] <- "Archaea" #put all archaea in same group
+dif.abundance$Group[dif.abundance$Class  == "D_2__Alphaproteobacteria"] <- "Alphaproteobacteria" #split up proteos and put each into groups
+dif.abundance$Group[dif.abundance$Class  == "D_2__Deltaproteobacteria"] <- "Deltaproteobacteria"
+dif.abundance$Group[dif.abundance$Class  == "D_2__Gammaproteobacteria"] <- "Gammaproteobacteria"
+Groups <- c("Archaea", "Alphaproteobacteria", "Deltaproteobacteria", 
+            "Gammaproteobacteria", "Acidobacteria",
+            "Actinobacteria", "Armatimonadetes", "Bacteroidetes", "Chloroflexi",
+            "Patescibacteria", "Planctomycetes", "Verrucomicrobia")
+dif.abundance$Group[!(dif.abundance$Group %in% Groups)] <- "Other" 
+dif.abundance$Group <- ordered(dif.abundance$Group, c("Archaea", "Alphaproteobacteria", "Deltaproteobacteria", 
+                                                      "Gammaproteobacteria", "Acidobacteria",
+                                                      "Actinobacteria", "Armatimonadetes", "Bacteroidetes", "Chloroflexi",
+                                                      "Patescibacteria", "Planctomycetes", "Verrucomicrobia", "Other"))
+dif.abundance$Habitat <- ordered(dif.abundance$Habitat, c("Needle", "Branch", "Root", "Rhizosphere"))
+
+dif.abundance %>% 
+  ggplot(aes(x = Group, y = log2FoldChange, col = Group, size = base_scaling.plot, label = Genus)) +
+  geom_jitter(alpha = 0.5) +
+  scale_color_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "lightgray")) +
+  facet_wrap(~Habitat) +
+  scale_y_continuous(name = "Fold Change", breaks = c(-6, -3, 0, 3, 6), labels = c("-64", "-8", "0", "8", "64")) +
+  scale_x_discrete(breaks = NULL) +
+  geom_text(data = dif.abundance %>% filter(Genus == "D_5__Mycobacterium")) +
+  theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "right",
+        legend.text = element_text(size = 10),
+        strip.text = element_text(size = 12)) +
+  geom_hline(yintercept = 0, linetype = "dashed", size = 1) +
+  geom_hline(yintercept = c(-6, -3, 3, 6), linetype = "dotted") +
+  guides(size = F,
+         color = guide_legend(ncol = 1, override.aes = list(size = 5, alpha = 1))) +
+  panel_border() -> fig.S6
+
+tiff("~/Desktop/NCHemlock2018/Figure_S6.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S6
+dev.off()
+```
+
+## ITS (Figure S11 & Table S3)
+```{r}
+data_ITS_counts@sam_data$infestation <- as.character(data_ITS_counts@sam_data$infestation) 
+data_ITS_counts@sam_data$species <- as.character(data_ITS_counts@sam_data$species) 
+data_ITS_NE <- subset_samples(data_ITS_counts, Habitat == "Needle")
+data_ITS_ST <- subset_samples(data_ITS_counts, Habitat == "Branch")
+data_ITS_RE <- subset_samples(data_ITS_counts, Habitat == "Root")
+data_ITS_RH <- subset_samples(data_ITS_counts, Habitat == "Rhizosphere")
+datas <- c(data_ITS_NE, data_ITS_ST, data_ITS_RE, data_ITS_RH)
+
+dif.abundance <- data.frame(matrix(ncol = 10, nrow = 0)) #Create empty df
+
+for(i in datas){
+  i <- prune_taxa(taxa_sums(i) > 0.5, i)
+  i@otu_table <- i@otu_table + 1
+  data.deseq <- phyloseq_to_deseq2(i, ~ infestation*species)
+  data.deseq$infestation = relevel(data.deseq$infestation, "Low")
+  diagdds <- DESeq(data.deseq, test = "Wald", fitType = "parametric", quiet = T)
+  res <- results(diagdds, contrast = c("infestation", "High", "Low"))
+  alpha <- 0.5
+  sigtab <- res[which(res$padj < alpha), ] #subset results tab to those below alpha
+  sigtab <- as.data.frame(sigtab)
+  if(nrow(sigtab) > 0) {
+    sigtab <- cbind(as(sigtab, "data.frame"), as(tax_table(i)[rownames(sigtab), ], "matrix"))}
+  if(nrow(sigtab) > 0) {
+    sigtab$Habitat <- levels(as.factor(i@sam_data$Habitat))}
+  dif.abundance <- rbind(dif.abundance, sigtab)
+}
+dif.abundance$OTU <- row.names(dif.abundance)
+dim(dif.abundance)
+
+dif.abundance %>% group_by(Habitat) %>% tally()
+
+FunGuild <- read.delim("~/Desktop/NCHemlock2018/Hemlock2018Samples/Fungi/table.from_biom_w_taxonomy.guilds.txt")
+FunGuild$Guild <- as.character(FunGuild$Guild)
+FunGuild$Guild[str_detect(FunGuild$Guild, "athogen") == TRUE] <- "Pathogen"
+
+dif.abundance2 <- merge(dif.abundance, FunGuild %>% dplyr::select(OTU.ID, Guild), by.x = "OTU", by.y = "OTU.ID", all.x = T)
+
+length(levels(as.factor(dif.abundance2$OTU)))
+
+write.csv(dif.abundance2, "~/Desktop/NCHemlock2018/Frontiers_resubmission/Table_S3.csv")
+
+dif.abundance <- dif.abundance2
+
+scaling <- data.frame(matrix(ncol = 10, nrow = 0))
+for(i in levels(as.factor(dif.abundance$Habitat))){
+  sub <- filter(dif.abundance, Habitat %in% i)
+  sub$base_scaling.plot <- sub$baseMean/max(sub$baseMean)*5
+  scaling <- rbind(scaling, sub)
+}
+dif.abundance <- merge(dif.abundance, scaling %>% dplyr::select(base_scaling.plot, OTU), by = "OTU")
+
+dif.abundance$Group <- sapply(strsplit(as.character(dif.abundance$Phylum ), "__"), `[`, 2) 
+
+dif.abundance$Habitat <- ordered(dif.abundance$Habitat, c("Needle", "Branch", "Root", "Rhizosphere"))
+
+dif.abundance %>% na.omit(Phylum) %>%
+  ggplot(aes(x = Group, y = log2FoldChange, col = Group, size = base_scaling.plot, label = Genus)) +
+  geom_jitter(alpha = 0.5) +
+  scale_color_manual(values = c("#ff7f0e", "#0e334d", "yellow",
+                                 "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#17becf",
+                                 "#7f7f7f", "black")) +
+  facet_wrap(~Habitat) +
+  scale_y_continuous(name = "Fold Change", breaks = c(-6, -3, 0, 3, 6), labels = c("-64", "-8", "0", "8", "64")) +
+  scale_x_discrete(breaks = NULL) +
+  geom_text(data = dif.abundance %>% filter(Genus == "g__Gibberella")) +
+  theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "right",
+        legend.text = element_text(size = 10),
+        strip.text = element_text(size = 12)) +
+  geom_hline(yintercept = 0, linetype = "dashed", size = 1) +
+  geom_hline(yintercept = c(-6, -3, 3, 6), linetype = "dotted") +
+  guides(size = F,
+         color = guide_legend(ncol = 1, override.aes = list(size = 5, alpha = 1))) +
+  panel_border() -> fig.S11
+
+tiff("~/Desktop/NCHemlock2018/Figure_S11.tiff", res = 100, height = 7, width = 6.5, units = "in")
+fig.S11
+dev.off()
+```
+
+# Environmental Variable CCA (both 16S and ITS together--Figure 4)
+```{r}
+# 16S -----------------------------------------------------------
+data_16S_env_NE <- subset_samples(data_16S, C > 0 & B_C > 0 & R_C > 0 & Habitat == "Needle")
+data_16S_env_ST <- subset_samples(data_16S, C > 0 & B_C > 0 & R_C > 0 & Habitat == "Branch")
+data_16S_env_RE <- subset_samples(data_16S, C > 0 & B_C > 0 & R_C > 0 & Habitat == "Root")
+data_16S_env_RH <- subset_samples(data_16S, C > 0 & B_C > 0 & R_C > 0 & Habitat == "Rhizosphere")
+
+df.16S <- data.frame(sample_data(data_16S_env_NE))
+OTU_16S <- t(as(data_16S_cca_NE@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+dist_16S <- vegdist(OTU_16S, "jaccard")
+set.seed(1221990)
+rda_16S <- dbrda(dist_16S ~ LBC + pHCaCl2 + C + N + B_CN, df.16S)
+varpart(dist_16S, ~LBC, ~C, ~N, ~B_CN, data = df.16S)
+## overall test
+set.seed(1221990)
+anova(rda_16S, permutations = 9999) 
+## Marginal or Type III effects
+set.seed(1221990)
+anova(rda_16S, by="margin") 
+
+plot.data <- merge(summary(rda_16S)$sites, df.16S, by = "row.names") 
+ggplot() +
+    geom_point(data = plot.data, aes(x = dbRDA1, y = dbRDA2, shape = species, fill = infestation), 
+               size = 4, alpha = 0.5) +
+    scale_shape_manual(values = c(21,24), name = "Host Species",
+                       labels = c(expression(italic("T. canadensis")), 
+                                  expression(italic("T. sieboldii")))) +
+    ggtitle("Needle (16S)") +
+    scale_x_continuous(name = paste0(paste0("dbRDA 1 (", round(100*as.data.frame(summary(rda_16S)$cont)[2,1], 1)), "%)")) +
+    scale_y_continuous(name = paste0(paste0("dbRDA 2 (", round(100*as.data.frame(summary(rda_16S)$cont)[2,2], 1)), "%)")) +
+    geom_segment(data = as.data.frame(summary(rda_16S)$biplot), aes(x = 0, y = 0, xend = dbRDA1, yend = dbRDA2),
+                 size = 0.5, color = "black", arrow = arrow()) +
+    #geom_text(data = as.data.frame(summary(rda_16S)$biplot) %>% rownames_to_column(), aes(x = dbRDA1, y = dbRDA2, label = rowname)) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.text = element_text(hjust = 0), title = element_text(size = 12),
+          legend.title = element_text(size = 12)) +
+    guides(fill = guide_legend(override.aes = list(pch = 21), title = "HWA pop.")) -> p1
+
+
+df.16S <- data.frame(sample_data(data_16S_env_ST))
+OTU_16S <- t(as(data_16S_env_ST@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+dist_16S <- vegdist(OTU_16S, "jaccard")
+set.seed(1221990)
+rda_16S <- dbrda(dist_16S ~ LBC + pHCaCl2 + C + N + B_CN, df.16S, method = "jaccard")
+varpart(dist_16S, ~LBC, ~C, ~N, ~B_CN, data = df.16S)
+## overall test
+set.seed(1221990)
+anova(rda_16S, permutations = 9999) 
+set.seed(1221990)
+anova(rda_16S, by="margin", permutations = 9999) 
+
+df.16S <- data.frame(sample_data(data_16S_env_RE))
+OTU_16S <- t(as(data_16S_env_RE@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+dist_16S <- vegdist(OTU_16S, "jaccard")
+set.seed(1221990)
+rda_16S <- dbrda(dist_16S ~ LBC + pHCaCl2 + C + N + R_CN, df.16S, method = "jaccard")
+varpart(dist_16S, ~LBC, ~C, ~pHCaCl2, ~R_CN, data = df.16S)
+## overall test
+set.seed(1221990)
+anova(rda_16S, permutations = 9999) 
+
+plot.data <- merge(summary(rda_16S)$sites, df.16S, by = "row.names") 
+ggplot() +
+    geom_point(data = plot.data, aes(x = dbRDA1, y = dbRDA2, shape = species, fill = infestation), 
+               size = 4, alpha = 0.5) +
+    scale_shape_manual(values = c(21,24), name = "Host Species",
+                       labels = c(expression(italic("T. canadensis")), 
+                                  expression(italic("T. sieboldii")))) +
+    ggtitle("Root (16S)") +
+    scale_x_continuous(name = paste0(paste0("dbRDA 1 (", round(100*as.data.frame(summary(rda_16S)$cont)[2,1], 1)), "%)")) +
+    scale_y_continuous(name = paste0(paste0("dbRDA 2 (", round(100*as.data.frame(summary(rda_16S)$cont)[2,2], 1)), "%)")) +
+    geom_segment(data = as.data.frame(summary(rda_16S)$biplot), aes(x = 0, y = 0, xend = dbRDA1, yend = dbRDA2),
+                 size = 0.5, color = "black", arrow = arrow()) +
+    #geom_text(data = as.data.frame(summary(rda_16S)$biplot) %>% rownames_to_column(), aes(x = dbRDA1, y = dbRDA2, label = rowname)) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.text = element_text(hjust = 0), title = element_text(size = 12),
+          legend.title = element_text(size = 12)) +
+    guides(fill = guide_legend(override.aes = list(pch = 21), title = "HWA pop.")) -> p3
+
+
+df.16S <- data.frame(sample_data(data_16S_env_RH))
+OTU_16S <- t(as(data_16S_env_RH@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+dist_16S <- vegdist(OTU_16S, "jaccard")
+set.seed(1221990)
+rda_16S <- dbrda(dist_16S ~ LBC + pHCaCl2 + C + N + CN, df.16S, method = "jaccard")
+## overall test
+anova(rda_16S) 
+
+# ITS -----------------------------------------------------------
+data_ITS_env_NE <- subset_samples(data_ITS, C > 0 & B_C > 0 & R_C > 0 & Habitat == "Needle")
+data_ITS_env_ST <- subset_samples(data_ITS, C > 0 & B_C > 0 & R_C > 0 & Habitat == "Branch")
+data_ITS_env_RE <- subset_samples(data_ITS, C > 0 & B_C > 0 & R_C > 0 & Habitat == "Root")
+data_ITS_env_RH <- subset_samples(data_ITS, C > 0 & B_C > 0 & R_C > 0 & Habitat == "Rhizosphere")
+
+df.ITS <- data.frame(sample_data(data_ITS_env_NE))
+OTU_ITS <- t(as(data_ITS_env_NE@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+dist_ITS <- vegdist(OTU_ITS, "jaccard")
+set.seed(1221990)
+rda_ITS <- dbrda(dist_ITS ~ LBC + pHCaCl2 + C + N + B_CN, df.ITS)
+varpart(dist_ITS, ~LBC, ~C, ~N, ~R_CN, data = df.ITS)
+## overall test
+set.seed(1221990)
+anova(rda_ITS, permutations = 9999)
+set.seed(1221990)
+anova(rda_ITS, by="margin") 
+
+plot.data <- merge(summary(rda_ITS)$sites, df.ITS, by = "row.names") 
+ggplot() +
+    geom_point(data = plot.data, aes(x = dbRDA1, y = dbRDA2, shape = species, fill = infestation), 
+               size = 4, alpha = 0.5) +
+    scale_shape_manual(values = c(21,24), name = "Host Species",
+                       labels = c(expression(italic("T. canadensis")), 
+                                  expression(italic("T. sieboldii")))) +
+    ggtitle("Needle (ITS)") +
+    scale_x_continuous(name = paste0(paste0("dbRDA 1 (", round(100*as.data.frame(summary(rda_ITS)$cont)[2,1], 1)), "%)")) +
+    scale_y_continuous(name = paste0(paste0("dbRDA 2 (", round(100*as.data.frame(summary(rda_ITS)$cont)[2,2], 1)), "%)")) +
+    geom_segment(data = as.data.frame(summary(rda_ITS)$biplot), aes(x = 0, y = 0, xend = dbRDA1, yend = dbRDA2),
+                 size = 0.5, color = "black", arrow = arrow()) +
+    #geom_text(data = as.data.frame(summary(rda_ITS)$biplot) %>% rownames_to_column(), aes(x = dbRDA1, y = dbRDA2, label = rowname)) +
+    theme(axis.title = element_text(size = 12), axis.text = element_text(size = 10),
+          legend.text = element_text(hjust = 0), title = element_text(size = 12),
+          legend.title = element_text(size = 12)) +
+    guides(fill = guide_legend(override.aes = list(pch = 21), title = "HWA pop.")) -> p4
+
+df.ITS <- data.frame(sample_data(data_ITS_env_ST))
+OTU_ITS <- t(as(data_ITS_env_ST@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+dist_ITS <- vegdist(OTU_ITS, "jaccard")
+set.seed(1221990)
+rda_ITS <- dbrda(dist_ITS ~ LBC + pHCaCl2 + C + N + B_CN, df.ITS)
+## overall test
+set.seed(1221990)
+anova(rda_ITS, permutations = 9999) 
+
+df.ITS <- data.frame(sample_data(data_ITS_env_RE))
+OTU_ITS <- t(as(data_env_cca_RE@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+dist_ITS <- vegdist(OTU_ITS, "jaccard")
+set.seed(1221990)
+rda_ITS <- dbrda(dist_ITS ~ LBC + pHCaCl2 + C + N + R_CN, df.ITS)
+## overall test
+set.seed(1221988)
+anova(rda_ITS)
+
+df.ITS <- data.frame(sample_data(data_ITS_env_RH))
+OTU_ITS <- t(as(data_ITS_env_RH@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+dist_ITS <- vegdist(OTU_ITS, "jaccard")
+set.seed(1221990)
+rda_ITS <- dbrda(dist_ITS ~ LBC + pHCaCl2 + C + N + CN, df.ITS)
+## overall test
+anova(rda_ITS) # p = 0.464
+
+# Put plots together -------------------------------------------------
+prow <- plot_grid(p1 + theme(legend.position = "none"),
+                  p3 + theme(legend.position = "none"), 
+                  p4 + theme(legend.position = "none"), 
+                  align = "vh", ncol = 1)
+leg <- get_legend(p1 + theme(legend.position = "bottom", legend.box = "vertical", legend.title = element_blank()))
+fig.4 <- plot_grid(prow, leg, rel_heights = c(1,0.1), ncol = 1)
+
+tiff("~/Desktop/NCHemlock2018/env_rdas.tiff", res = 100, width = 3, height = 7, units = "in")
+fig.4
+dev.off()
+```
+
+# Mycorrhizal abundance (Figure 6)
+```{r}
+data_ITS_RH <- subset_samples(data_ITS, Habitat == "Rhizosphere")
+FunGuild_RH <- read.delim("~/Desktop/NCHemlock2018/Hemlock2018Samples/Fungi/table.from_biom_w_taxonomy.guilds.txt")
+FunGuild_RH$Guild[str_detect(FunGuild_RH$Guild, "Ectomycorrhizal") == TRUE] <- "Ectomycorrhizal"
+tax <- as.data.frame(as(tax_table(data_ITS_RH), "matrix"))
+tax2 <- merge(tax, FunGuild_RH %>% dplyr::select(OTU.ID, Guild), by.x = "row.names", by.y = "OTU.ID", all.x = T)
+tax2 <- as(tax2, "matrix")
+TAX <- tax_table(tax2)
+
+taxa_names(TAX) <- tax2[,1]
+data_ITS_RH_guild <- merge_phyloseq(otu_table(data_ITS_RH), TAX, data_ITS_RH@sam_data)
+data_rel_ITS_RH <- transform_sample_counts(data_ITS_RH_guild, function(x) x/sum(x))
+Myco <- subset_taxa(data_rel_ITS_RH, Guild == "Ectomycorrhizal" | Guild == "Arbuscular Mycorrhizal")
+myco_melt_RH <- psmelt(Myco)
+
+myco_melt_RH %>%
+  group_by(infestation, species, Guild, Sample_ID) %>%
+  summarise(sum = sum(Abundance)) %>%
+  mutate(Habitat = "Rhizosphere") -> Myco_Rhizosphere
+
+data_ITS_RE <- subset_samples(data_ITS, Habitat == "Root")
+FunGuild_RE <- read.delim("~/Desktop/NCHemlock2018/Hemlock2018Samples/Fungi/table.from_biom_w_taxonomy.guilds.txt")
+FunGuild_RE$Guild[str_detect(FunGuild_RE$Guild, "Ectomycorrhizal") == TRUE] <- "Ectomycorrhizal"
+tax <- as.data.frame(as(tax_table(data_ITS_RE), "matrix"))
+tax2 <- merge(tax, FunGuild_RE %>% dplyr::select(OTU.ID, Guild), by.x = "row.names", by.y = "OTU.ID", all.x = T)
+tax2 <- as(tax2, "matrix")
+TAX <- tax_table(tax2)
+
+taxa_names(TAX) <- tax2[,1]
+data_ITS_RE_guild <- merge_phyloseq(otu_table(data_ITS_RE), TAX, data_ITS_RE@sam_data)
+data_rel_ITS_RE <- transform_sample_counts(data_ITS_RE_guild, function(x) x/sum(x))
+Myco <- subset_taxa(data_rel_ITS_RE, Guild == "Ectomycorrhizal" | Guild == "Arbuscular Mycorrhizal")
+myco_melt_RE <- psmelt(Myco)
+
+myco_melt_RE %>%
+  group_by(infestation, species, Guild, Sample_ID) %>% 
+  dplyr::summarise(sum = sum(Abundance)*100) %>%
+  ungroup(infestation, species, Guild, Sample_ID) %>%
+  group_by(infestation, species, Guild) %>%
+  dplyr::summarise(mean = mean(sum), se = sd(sum)/sqrt(n())) %>%
+  ggplot(aes(x = species, y = mean, fill = infestation)) +
+    geom_bar(stat = "identity", col = "black", position = position_dodge(0.9)) +
+    geom_errorbar(aes(ymin = mean-se, ymax = mean + se), width = 0.2, position = position_dodge(0.9)) +
+    facet_wrap(~Guild, scales = "free") +
+    scale_y_continuous(name = "Relative Abundance (%)") +
+    theme(axis.title.x = element_blank(),
+          strip.text = element_text(size = 12),
+          legend.position = "none", 
+          axis.text.x = element_text(face = "italic")) +
+    ggtitle("Root") -> p_RE
+
+x <- aov(sum ~ infestation*species, data = myco_melt_RE %>%
+           group_by(infestation, species, Guild, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100) %>%
+           filter(Guild == "Ectomycorrhizal"))
+summary(x) 
+
+x <- aov(log(sum +1) ~ infestation*species, data = myco_melt_RH %>%
+           group_by(infestation, species, Guild, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100) %>%
+           filter(Guild == "Arbuscular Mycorrhizal"))
+summary(x) 
+TukeyHSD(x)
+
+kruskal.test(sum ~ infestation, data = myco_melt_RH %>%
+           group_by(infestation, species, Guild, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100) %>%
+           filter(Guild == "Arbuscular Mycorrhizal"))
+
+myco_melt_RH %>%
+  group_by(infestation, species, Guild, Sample_ID) %>%
+  summarise(sum = sum(Abundance)*100) %>%
+  ungroup(infestation, species, Guild, Sample_ID) %>%
+  group_by(infestation, species, Guild) %>%
+  summarise(mean = mean(sum), se = sd(sum)/sqrt(n())) %>%
+  ggplot(aes(x = species, y = mean, fill = infestation)) +
+    geom_bar(stat = "identity", col = "black", position = position_dodge(0.9)) +
+    geom_errorbar(aes(ymin = mean-se, ymax = mean + se), width = 0.2, position = position_dodge(0.9)) +
+    facet_wrap(~Guild, scales = "free") +
+    scale_y_continuous(name = "Relative Abundance (%)") +
+    theme(axis.title.x = element_blank(),
+          legend.position = "right", 
+          axis.text.x = element_text(face = "italic"),
+          #legend.justification = "center",
+          legend.title = element_text(size = 12)) +
+    ggtitle("Rhizosphere") +
+    guides(fill = guide_legend(title = "HWA pop.")) -> p_RH
+
+prow <- plot_grid(p_RE, p_RH + theme(legend.position = "none"), align = "vh", axis = "lr", ncol = 1)
+
+leg <- get_legend(p_RH)
+
+prow <- plot_grid(prow, leg, ncol = 2, rel_widths = c(1, 0.25))
+
+tiff("~/Desktop/NCHemlock2018/Myco_Abun.tiff", res = 100, height = 4.2, width = 6, units = "in")
+prow
+dev.off()
+
+myco_melt_RH$Abundance[myco_melt_RH$Abundance > 0] <- 1
+x <- aov(sum ~ infestation * species, myco_melt_RH %>%
+                                        group_by(infestation, species, Sample_ID) %>%
+                                        summarise(sum = sum(Abundance)))
+shapiro.test(resid(x)) # pass
+summary(x) # nothing sig. infest - 0.192, species - 0.588
+
+myco_melt_RE$Abundance[myco_melt_RE$Abundance > 0] <- 1
+x <- aov(sqrt(sum) ~ infestation * species, myco_melt_RE %>%
+                                        group_by(infestation, species, Sample_ID) %>%
+                                        summarise(sum = sum(Abundance)))
+shapiro.test(resid(x)) # pass
+summary(x) # sig
+TukeyHSD(x)
+
+myco_melt_RE %>%
+           group_by(infestation, species, Guild, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100) %>%
+           filter(Guild == "Arbuscular Mycorrhizal") -> test
+```
+
+# Mycorrhizal Composition (Figure S12)
+```{r}
+view_tax <- function(x){
+  View(as.data.frame(as(tax_table(x), "matrix")))
+}
+
+list_tax <- function(x, y){
+  levels(as.factor(as.character(as.data.frame(as(tax_table(x), "matrix"))[,y])))
+}
+
+data_ITS_RH <- subset_samples(data_ITS, Habitat == "Rhizosphere")
+FunGuild_RH <- read.delim("~/Desktop/NCHemlock2018/Hemlock2018Samples/Fungi/table.from_biom_w_taxonomy.guilds.txt")
+FunGuild_RH$Guild[str_detect(FunGuild_RH$Guild, "Ectomycorrhizal") == TRUE] <- "Ectomycorrhizal"
+tax <- as.data.frame(as(tax_table(data_ITS_RH), "matrix"))
+tax2 <- merge(tax, FunGuild_RH %>% dplyr::select(OTU.ID, Guild), by.x = "row.names", by.y = "OTU.ID", all.x = T)
+tax2 <- as(tax2, "matrix")
+TAX <- tax_table(tax2)
+
+taxa_names(TAX) <- tax2[,1]
+data_ITS_RH_guild <- merge_phyloseq(otu_table(data_ITS_RH), TAX, data_ITS_RH@sam_data)
+Myco <- subset_taxa(data_rel_ITS_RH, Guild == "Ectomycorrhizal")
+data_rel_RH_ECM <- transform_sample_counts(Myco, function(x) x/sum(x))
+data_rel_RH_ECM <- prune_taxa(taxa_sums(data_rel_RH_ECM) > 0, data_rel_RH_ECM) #393 taxa
+
+df_rel_RH_ECM <- data.frame(sample_data(data_rel_RH_ECM))
+
+OTU_ITS <- t(as(data_rel_RH_ECM@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+dist_ITS <- vegdist(OTU_ITS, "jaccard")
+set.seed(1221990)
+rda_ITS <- dbrda(dist_ITS ~ infestation + species, df_rel_RH_ECM)
+anova(rda_ITS, by = "margin", permutations = 9999)
+
+data_ITS_RE <- subset_samples(data_ITS, Habitat == "Root")
+FunGuild_RE <- read.delim("~/Desktop/NCHemlock2018/Hemlock2018Samples/Fungi/table.from_biom_w_taxonomy.guilds.txt")
+FunGuild_RE$Guild[str_detect(FunGuild_RE$Guild, "Ectomycorrhizal") == TRUE] <- "Ectomycorrhizal"
+tax <- as.data.frame(as(tax_table(data_ITS_RE), "matrix"))
+tax2 <- merge(tax, FunGuild_RE %>% dplyr::select(OTU.ID, Guild), by.x = "row.names", by.y = "OTU.ID", all.x = T)
+tax2 <- as(tax2, "matrix")
+TAX <- tax_table(tax2)
+
+taxa_names(TAX) <- tax2[,1]
+data_ITS_RE_guild <- merge_phyloseq(otu_table(data_ITS_RE), TAX, data_ITS_RE@sam_data)
+Myco <- subset_taxa(data_rel_ITS_RE, Guild == "Ectomycorrhizal")
+Myco <- prune_taxa(taxa_sums(Myco) > 0, Myco) #123 taxa
+data_rel_RE_ECM <- transform_sample_counts(Myco, function(x) x/sum(x))
+
+
+df_rel_RE_ECM <- data.frame(sample_data(data_rel_RE_ECM))
+
+OTU_ITS <- t(as(data_rel_RE_ECM@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+dist_ITS <- vegdist(OTU_ITS, "jaccard")
+set.seed(1221990)
+rda_ITS <- dbrda(dist_ITS ~ infestation + species, df_rel_RE_ECM)
+anova(rda_ITS, by = "margin", permutations = 9999)
+
+glommed <- tax_glom(data_rel_RE_ECM, "Class")
+melted <- psmelt(glommed)
+sum2 <- melted %>% 
+  group_by(infestation, Class, species, Sample_ID) %>%
+  summarise(sums = sum(Abundance))
+
+#Fix names
+sum2$Class <- sapply(strsplit(as.character(sum2$Class), "__"), `[`, 2)
+
+sum2 %>%
+  group_by(infestation, Class, species) %>%
+  summarise(means = mean(sums)) %>%
+  ggplot(aes(x = infestation, y = means, fill = Class)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e","#1f77b4", "yellow", "#17becf",
+                               "#2ca02c", "#d62728", "grey", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    theme(strip.text = element_text(size = 12, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12)) +
+    ggtitle("Root") -> p_RE
+
+glommed <- tax_glom(data_rel_RH_ECM, "Class")
+melted <- psmelt(glommed)
+sum2 <- melted %>% 
+  group_by(infestation, Class, species, Sample_ID) %>%
+  summarise(sums = sum(Abundance))
+
+#Fix names
+sum2$Class <- sapply(strsplit(as.character(sum2$Class), "__"), `[`, 2)
+
+sum2 %>%
+  group_by(infestation, Class, species) %>%
+  summarise(means = mean(sums)) %>%
+  ggplot(aes(x = infestation, y = means, fill = Class)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~species) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e","#1f77b4", "yellow", "#d62728", "#17becf",
+                               "#2ca02c", "grey", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    theme(strip.text = element_text(size = 12, face = "italic"), axis.text.x = element_text(size = 10),
+          axis.title = element_blank(),
+          title = element_text(size = 12)) +
+    ggtitle("Rhizosphere") -> p_RH
+
+prow <- plot_grid(p_RE, p_RH, align = "vh", ncol = 1)
+
+tiff("~/Desktop/NCHemlock2018/EMcomposition.tiff", res = 100, height = 5, width = 6.5, units = "in")
+prow
+dev.off()
+```
+
+# Pathogen Abundance (Figure 5)
+```{r}
+FunGuild <- read.delim("~/Desktop/NCHemlock2018/Hemlock2018Samples/Fungi/table.from_biom_w_taxonomy.guilds.txt")
+FunGuild$Guild <- as.character(FunGuild$Guild)
+FunGuild$Guild[str_detect(FunGuild$Guild, "athogen") == TRUE] <- "Pathogen"
+FunGuild$Guild[FunGuild$Guild != "Pathogen"] <- "Not Pathogen"
+
+tax <- as.data.frame(as(tax_table(data_ITS), "matrix"))
+tax2 <- merge(tax, FunGuild %>% dplyr::select(OTU.ID, Guild), by.x = "row.names", by.y = "OTU.ID", all.x = T)
+tax2 <- as(tax2, "matrix")
+TAX <- tax_table(tax2)
+
+taxa_names(TAX) <- tax2[,1]
+data_ITS_path <- merge_phyloseq(otu_table(data_ITS), TAX, data_ITS@sam_data)
+data_ITS_path <- transform_sample_counts(data_ITS_path, function(x) x/sum(x))
+Path <- subset_taxa(data_ITS_path, Guild == "Pathogen")
+Path_melt <- psmelt(Path)
+
+Path_melt$Guild <- as.character(Path_melt$Guild)
+
+Path_melt %>%
+  group_by(species, infestation, Sample_ID, Habitat) %>%
+  summarise(sum = sum(Abundance)*100) %>%
+  ungroup(species, infestation, Habitat, Sample_ID) %>%
+  group_by(species, infestation, Habitat) %>%
+  summarise(mean = mean(sum), se = sd(sum)/sqrt(n())) %>%
+  ggplot(aes(x = species, y = mean, fill = infestation)) +
+    geom_bar(stat = "identity", col = "black", position = position_dodge(0.9)) +
+    geom_errorbar(aes(ymin = mean-se, ymax = mean + se), width = 0.2, position = position_dodge(0.9)) +
+    facet_wrap(~Habitat) +
+    scale_y_continuous(name = "Relative Abundance (%)") +
+    labs(fill = "HWA pop.") +
+    theme(legend.position = "right",
+          legend.title = element_text(size = 12),
+          strip.text = element_text(size = 12),
+          axis.title.x = element_blank(),
+          legend.justification = "center",
+          axis.text.x = element_text(face = "italic")) -> path_plot
+
+tiff("~/Desktop/NCHemlock2018/pathogens.tiff", res = 100, height = 4.2, width = 6, units = "in")
+path_plot
+dev.off()
+
+Path_melt$spec <- Path_melt$species
+
+model <- lme(log(sum +1) ~ infestation*spec*Habitat, random=~1|tree.ID, data = Path_melt %>% 
+           group_by(spec, infestation, Habitat, tree.ID, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100), method = "REML")
+anova.lme(model, type="sequential", adjustSigma = T)
+summary(glht(model, mcp(spec="Tukey"))) 
+
+x <- aov(log(sum) ~ infestation*species, Path_melt %>% 
+           filter(Habitat == "Needle") %>%
+           group_by(species, infestation, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100))
+shapiro.test(resid(x))
+summary(x) 
+
+x <- aov(log(sum) ~ infestation*species, Path_melt %>% 
+           filter(Habitat == "Branch") %>%
+           group_by(species, infestation, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100))
+shapiro.test(resid(x))
+summary(x) 
+
+x <- aov(log(sum +1) ~ infestation*species, Path_melt %>% 
+           filter(Habitat == "Root") %>%
+           group_by(species, infestation, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100))
+shapiro.test(resid(x))
+summary(x) 
+TukeyHSD(x) 
+
+x <- aov(log(sum) ~ infestation*species, Path_melt %>% 
+           filter(Habitat == "Rhizosphere") %>%
+           group_by(species, infestation, Sample_ID) %>%
+           summarise(sum = sum(Abundance)*100))
+shapiro.test(resid(x))
+summary(x) 
+
+Path_melt %>%
+  group_by(species, infestation, Sample_ID, Habitat) %>%
+  summarise(sum = sum(Abundance)*100) %>%
+  ungroup(species, infestation, Habitat, Sample_ID) %>%
+  filter(Habitat == "Root", infestation == "Low") %>%
+  group_by(species) %>%
+  summarise(mean = mean(sum, na.rm = T), se = sd(sum)/sqrt(n()))
+
+```
