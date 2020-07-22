@@ -8,3 +8,5 @@ Nicholas C. Dove<sup>1</sup>, Timothy J. Rogers<sup>2</sup>, Christy Leppanen<su
 <sup>4</sup>Department of Horticultural Science, North Carolina State University, Mills River, NC, United States
 
 Front. Microbiol., 07 July 2020 | <a href="https://doi.org/10.3389/fmicb.2020.01528">https://doi.org/10.3389/fmicb.2020.01528</a>
+
+## Raw data can be found in the Sequence Read Archive (<a href="https://www.ncbi.nlm.nih.gov/bioproject/622552"></a>) under project ID 622552.
