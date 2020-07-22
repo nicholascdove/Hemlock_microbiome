@@ -7,3 +7,4 @@ Nicholas C. Dove<sup>1</sup>, Timothy J. Rogers<sup>2</sup>, Christy Leppanen<su
 <sup>3</sup>Department of Ecology & Evolutionary Biology, The University of Tennessee, Knoxville, Knoxville, TN, United States<br>
 <sup>4</sup>Department of Horticultural Science, North Carolina State University, Mills River, NC, United States
 
+Front. Microbiol., 07 July 2020 | <a href="https://doi.org/10.3389/fmicb.2020.01528">https://doi.org/10.3389/fmicb.2020.01528</a>
