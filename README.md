@@ -13,4 +13,4 @@ Front. Microbiol., 07 July 2020 | <a href="https://doi.org/10.3389/fmicb.2020.01
 
 - Or use my pre-made feature, taxonomy, and metadata tables found in this repository
 
-- Please contact Nicholas Dove (dovenc@ornl.gov) with any questions or comments.
+- Please contact Nicholas Dove (dovenc@ornl.gov) with any questions or comments. I'm always happy to help :).
